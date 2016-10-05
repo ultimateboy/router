@@ -24,9 +24,10 @@ const (
 )
 
 var (
-	namespace   = utils.GetOpt("POD_NAMESPACE", "default")
-	modeler     = modelerUtility.NewModeler(prefix, modelerFieldTag, modelerConstraintTag, true)
-	listOptions api.ListOptions
+	namespace         = utils.GetOpt("POD_NAMESPACE", "default")
+	annotationModeler = modelerUtility.NewModeler(prefix, modelerFieldTag, modelerConstraintTag, true)
+	configmapModeler  = modelerUtility.NewModeler("", modelerFieldTag, modelerConstraintTag, true)
+	listOptions       api.ListOptions
 )
 
 func init() {
@@ -209,14 +210,27 @@ func newHSTSConfig() *HSTSConfig {
 // relevant metadata concerning itself and all routable services.
 func Build(kubeClient *kubernetes.Clientset) (*RouterConfig, error) {
 	// Get all relevant information from k8s:
+	//   deis-router configMap (if exists)
 	//   deis-router deployment
 	//   All services with label "routable=true"
 	//   deis-builder service, if it exists
 	// These are used to construct a model...
+
+	configMap, err := getConfigMap(kubeClient)
+	if err != nil {
+		if !errors.IsNotFound(err) {
+			// If the error is anything but not found, fail.
+			return nil, err
+		}
+		// Otherwise, the configMap is not found, set as empty.
+		configMap = nil
+	}
+
 	routerDeployment, err := getDeployment(kubeClient)
 	if err != nil {
 		return nil, err
 	}
+
 	appServices, err := getAppServices(kubeClient)
 	if err != nil {
 		return nil, err
@@ -235,7 +249,7 @@ func Build(kubeClient *kubernetes.Clientset) (*RouterConfig, error) {
 		return nil, err
 	}
 	// Build the model...
-	routerConfig, err := build(kubeClient, routerDeployment, platformCertSecret, dhParamSecret, appServices, builderService)
+	routerConfig, err := build(kubeClient, routerDeployment, configMap, platformCertSecret, dhParamSecret, appServices, builderService)
 	if err != nil {
 		return nil, err
 	}
@@ -248,6 +262,14 @@ func getDeployment(kubeClient *kubernetes.Clientset) (*v1beta1ext.Deployment, er
 		return nil, err
 	}
 	return deployment, nil
+}
+
+func getConfigMap(kubeClient *kubernetes.Clientset) (*v1.ConfigMap, error) {
+	configMap, err := kubeClient.ConfigMaps(namespace).Get("deis-router")
+	if err != nil {
+		return nil, err
+	}
+	return configMap, nil
 }
 
 func getAppServices(kubeClient *kubernetes.Clientset) (*v1.ServiceList, error) {
@@ -291,8 +313,8 @@ func getSecret(kubeClient *kubernetes.Clientset, name string, ns string) (*v1.Se
 	return secret, nil
 }
 
-func build(kubeClient *kubernetes.Clientset, routerDeployment *v1beta1ext.Deployment, platformCertSecret *v1.Secret, dhParamSecret *v1.Secret, appServices *v1.ServiceList, builderService *v1.Service) (*RouterConfig, error) {
-	routerConfig, err := buildRouterConfig(routerDeployment, platformCertSecret, dhParamSecret)
+func build(kubeClient *kubernetes.Clientset, routerDeployment *v1beta1ext.Deployment, configMap *v1.ConfigMap, platformCertSecret *v1.Secret, dhParamSecret *v1.Secret, appServices *v1.ServiceList, builderService *v1.Service) (*RouterConfig, error) {
+	routerConfig, err := buildRouterConfig(routerDeployment, configMap, platformCertSecret, dhParamSecret)
 	if err != nil {
 		return nil, err
 	}
@@ -317,12 +339,32 @@ func build(kubeClient *kubernetes.Clientset, routerDeployment *v1beta1ext.Deploy
 	return routerConfig, nil
 }
 
-func buildRouterConfig(routerDeployment *v1beta1.Deployment, platformCertSecret *v1.Secret, dhParamSecret *v1.Secret) (*RouterConfig, error) {
+func mergeRouterConfig(routerDeployment *v1beta1.Deployment, configMap *v1.ConfigMap) (*RouterConfig, error) {
 	routerConfig := newRouterConfig()
-	err := modeler.MapToModel(routerDeployment.Annotations, "nginx", routerConfig)
+
+	if configMap != nil {
+		err := configmapModeler.MapToModel(configMap.Data, "nginx", routerConfig)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// To maintain backwards compatibility with previous Deis releases and Kube < 1.2
+	// annotations on the router Deployment override the ConfigMap.
+	err := annotationModeler.MapToModel(routerDeployment.Spec.Template.Annotations, "nginx", routerConfig)
 	if err != nil {
 		return nil, err
 	}
+
+	return routerConfig, nil
+}
+
+func buildRouterConfig(routerDeployment *v1beta1.Deployment, configMap *v1.ConfigMap, platformCertSecret *v1.Secret, dhParamSecret *v1.Secret) (*RouterConfig, error) {
+	routerConfig, err := mergeRouterConfig(routerDeployment, configMap)
+	if err != nil {
+		return nil, err
+	}
+
 	if platformCertSecret != nil {
 		platformCertificate, err := buildCertificate(platformCertSecret, "platform")
 		if err != nil {
@@ -353,7 +395,7 @@ func buildAppConfig(kubeClient *kubernetes.Clientset, service v1.Service, router
 	if appConfig.Name != service.Namespace {
 		appConfig.Name = service.Namespace + "/" + appConfig.Name
 	}
-	err := modeler.MapToModel(service.Annotations, "", appConfig)
+	err := annotationModeler.MapToModel(service.Annotations, "", appConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -398,7 +440,7 @@ func buildAppConfig(kubeClient *kubernetes.Clientset, service v1.Service, router
 func buildBuilderConfig(service *v1.Service) (*BuilderConfig, error) {
 	builderConfig := newBuilderConfig()
 	builderConfig.ServiceIP = service.Spec.ClusterIP
-	err := modeler.MapToModel(service.Annotations, "nginx", builderConfig)
+	err := annotationModeler.MapToModel(service.Annotations, "nginx", builderConfig)
 	if err != nil {
 		return nil, err
 	}
