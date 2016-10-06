@@ -351,7 +351,7 @@ func mergeRouterConfig(routerDeployment *v1beta1.Deployment, configMap *v1.Confi
 
 	// To maintain backwards compatibility with previous Deis releases and Kube < 1.2
 	// annotations on the router Deployment override the ConfigMap.
-	err := annotationModeler.MapToModel(routerDeployment.Spec.Template.Annotations, "nginx", routerConfig)
+	err := annotationModeler.MapToModel(routerDeployment.Annotations, "nginx", routerConfig)
 	if err != nil {
 		return nil, err
 	}
